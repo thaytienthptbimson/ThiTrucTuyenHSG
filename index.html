@@ -250,7 +250,7 @@ body.shot-hide #list-student,body.shot-hide #q-panel{visibility:hidden}
         <label class="btn sec" for="li-new" title="Thêm đề từ file exams.json vào danh sách (không cần có sẵn đề)">⬇️ Nhập đề từ exams.json</label>
         <input type="file" id="li-new" accept=".json,application/json" hidden>
       </div>
-      <p class="note"><b>Quy trình thi trực tuyến:</b><br>1. Tải đề lên &rarr; 2. Chọn Cài đặt &rarr; 3. Chọn <b>Xuất thư viện (exams.json)</b> ở Đề thi tương ứng và tải lên Github đè vào file cũ &rarr; 4. Gửi Link thi.</p>
+      <p class="note"><b>Quy trình thi trực tuyến:</b><br>1. Tải đề lên &rarr; 2. Chọn Cài đặt (có thể nhúng trực tiếp file .mp3 vào đề) &rarr; 3. Chọn <b>Xuất thư viện (exams.json)</b> ở Đề thi tương ứng và tải lên Github đè vào file cũ &rarr; 4. Gửi Link thi.</p>
       <p class="note"><b>Sao lưu / chuyển đề:</b> Mỗi đề thi trong danh sách có mục <b>Xuất/Nhập thư viện riêng biệt</b>. Nút <b>Nhập thư viện</b> cho phép chọn file exams.json để ghi đè cập nhật nội dung cho duy nhất đề hiện tại.</p>
     </div>
 
@@ -380,8 +380,21 @@ const PG = { on: 0, mute: 0, busy: 0, viol: [], stream: null, det: null, tm: nul
 const LK = 'exams_v2';
 const L4 = 'ABCD';
 const isEnScale = sc => sc === 'english' || sc === 'hsg';
-const PART_RE = /^\s*(?:part|phần|section)\s*(?:\d+|[ivx]+|[a-e])\b/i;
-const isListen = t => /listening|nghe/i.test(t || '');
+const PART_RE = /^\s*(?:(?:part|phần|section)\s*(?:\d+|[ivx]+|[a-e])|(?:[ivx]+|[a-e])\s*[.:)\-]\s*(?:listening|phonetics|lexico|reading|writing|grammar|vocabulary|use of english|nghe|đọc|viết|ngữ âm|từ vựng|ngữ pháp))\b/i;
+const isListen = t => /listening|nghe|audio|track/i.test(t || '');
+
+// Hỗ trợ IndexedDB để lưu đề thi có nhúng mã file MP3 dung lượng lớn (> 5MB) không bị lỗi tràn localStorage
+const idbOp = (mode, fn) => new Promise(res => {
+    try {
+        const rq = indexedDB.open('ExamAudioDB', 1);
+        rq.onupgradeneeded = e => e.target.result.createObjectStore('kv');
+        rq.onsuccess = e => {
+            const tx = e.target.result.transaction('kv', mode);
+            fn(tx.objectStore('kv'), res);
+        };
+        rq.onerror = () => res(null);
+    } catch(e) { res(null); }
+});
 
 let serverOffset = 0, gateTimer = null;
 const nowMs = () => Date.now() + serverOffset;
@@ -426,26 +439,47 @@ function initTeacherFlow() {
     if(ok) loadLib();
 }
 
-function loadLib() {
+async function loadLib() {
     try { lib = JSON.parse(localStorage.getItem(LK) || '[]'); } catch(e) { lib = []; }
+    const dbLib = await idbOp('readonly', (st, res) => {
+        const g = st.get(LK); g.onsuccess = () => res(g.result); g.onerror = () => res(null);
+    });
+    if(Array.isArray(dbLib) && dbLib.length) lib = dbLib;
     showLib();
 }
+
 function saveLib() {
     let ok = true;
     try { localStorage.setItem(LK, JSON.stringify(lib)); }
-    catch(e) { ok = false; alert('Lỗi bộ nhớ trình duyệt, vui lòng dọn dẹp hoặc xuất exams.json'); }
+    catch(e) {
+        // Nếu file MP3 nhúng mã Base64 làm vượt 5MB của localStorage thì lưu bản rút gọn ở localStorage và bản đầy đủ ở IndexedDB
+        try {
+            const light = lib.map(x => Object.assign({}, x, {
+                audio: (x.audio || '').startsWith('data:') ? '' : x.audio,
+                parts: Object.fromEntries(Object.entries(x.parts || {}).map(([k, v]) => [k, Object.assign({}, v, { audio: (v.audio || '').startsWith('data:') ? '' : v.audio })]))
+            }));
+            localStorage.setItem(LK, JSON.stringify(light));
+        } catch(_) {}
+    }
+    idbOp('readwrite', (st, res) => { st.put(lib, LK); res(true); });
     showLib();
     return ok;
+}
+
+function hasExamAudio(x) {
+    if(x && x.audio) return true;
+    return !!(x && x.parts && Object.values(x.parts).some(p => p && p.audio));
 }
 
 function showLib() {
     $('lt').textContent = `📚 Danh sách đề thi (${lib.length})`;
     $('libl').innerHTML = lib.length ? lib.map((x, i) => {
         const tScale = x.scale === 'math' ? 'Toán' : (x.scale === 'hsg' ? 'Đề HSG' : (x.scale === 'english' ? 'Tiếng Anh' : 'Môn chung'));
+        const auTag = hasExamAudio(x) ? ' • 🎧 Có Audio MP3' : '';
         return `
         <div class="lr">
             <div class="lr-info"><span class="no">${i+1}</span>
-            <div><b>${esc(x.name)}</b><div class="note">${x.items.filter(k=>k.k==='q').length} câu • Cài đặt: ${x.time||0} phút - Thang điểm: ${tScale}${(x.openAt||x.closeAt) ? `<br>🕒 ${x.openAt ? 'Mở: ' + fmtDT(x.openAt) : 'Mở: ngay'} — ${x.closeAt ? 'Đóng: ' + fmtDT(x.closeAt) : 'không giới hạn'}` : ''}</div></div></div>
+            <div><b>${esc(x.name)}</b><div class="note">${x.items.filter(k=>k.k==='q').length} câu • Cài đặt: ${x.time||0} phút - Thang điểm: ${tScale}${auTag}${(x.openAt||x.closeAt) ? `<br>🕒 ${x.openAt ? 'Mở: ' + fmtDT(x.openAt) : 'Mở: ngay'} — ${x.closeAt ? 'Đóng: ' + fmtDT(x.closeAt) : 'không giới hạn'}` : ''}</div></div></div>
             <div class="lr-act">
                 <button class="btn sec" onclick="openExam('${x.id}')">Quản lý</button>
                 <button class="btn sec" title="Xuất file exams.json riêng cho đề này" onclick="exportExam('${x.id}')">⬆️ Xuất thư viện (exams.json)</button>
@@ -484,22 +518,35 @@ window.openExam = (id) => {
     renderTeacherPreview();
 };
 
+function syncCurrentSettingsToExam() {
+    if(!exam) return true;
+    const oa = fromLocalInput($('open-at').value), ca = fromLocalInput($('close-at').value);
+    if(oa && ca && ca <= oa) { alert('Giờ đóng đề phải sau giờ mở đề. Vui lòng kiểm tra lại.'); return false; }
+    exam.openAt = oa;
+    exam.closeAt = ca;
+    exam.time = parseInt($('time-limit').value) || 0;
+    exam.scale = $('exam-scale').value;
+    exam.shufGrp = $('chk-shuf-grp').checked;
+    exam.shufQ = $('chk-shuf-q').checked;
+    exam.shufOpt = $('chk-shuf-opt').checked;
+    const mx = parseFloat($('max-score').value);
+    exam.maxScore = mx > 0 ? mx : 10;
+    const cfg = readPartCfg();
+    exam.parts = cfg.parts;
+    exam.audio = cfg.examAudio;
+    exam.audioName = cfg.examAudioName;
+    exam.proctor = $('chk-proctor').checked;
+    exam.maxViol = Math.max(0, parseInt($('max-viol').value) || 0);
+    return true;
+}
+
 $('btn-save-settings').onclick = () => {
     if(exam) {
-        const oa = fromLocalInput($('open-at').value), ca = fromLocalInput($('close-at').value);
-        if(oa && ca && ca <= oa) return alert('Giờ đóng đề phải sau giờ mở đề. Vui lòng kiểm tra lại.');
+        const ca = fromLocalInput($('close-at').value);
         if(ca && ca <= Date.now() && !confirm('Giờ đóng đề đã qua, học sinh sẽ không vào làm được. Vẫn lưu?')) return;
-        exam.openAt = oa;
-        exam.closeAt = ca;
-        exam.time = parseInt($('time-limit').value) || 0;
-        exam.scale = $('exam-scale').value;
-        exam.shufGrp = $('chk-shuf-grp').checked;
-        exam.shufQ = $('chk-shuf-q').checked;
-        exam.shufOpt = $('chk-shuf-opt').checked;
-        { const mx = parseFloat($('max-score').value); exam.maxScore = mx > 0 ? mx : 10; }
-        if (partList(exam.items).length) exam.parts = readPartCfg();
-        exam.proctor = $('chk-proctor').checked; exam.maxViol = Math.max(0, parseInt($('max-viol').value) || 0);
+        if(!syncCurrentSettingsToExam()) return;
         saveLib();
+        renderTeacherPreview();
         alert('Đã lưu cài đặt! Nhớ xuất lại file exams.json của đề này để cập nhật lên Github.');
     }
 };
@@ -524,9 +571,12 @@ function downloadJSON(obj, filename) {
     setTimeout(() => URL.revokeObjectURL(url), 2000);
 }
 
-// Xuất riêng biệt cấu trúc cho TỪNG đề vào file exams.json 
-// (Bọc dưới dạng array 1 phần tử để ứng dụng HS luôn tự parse độc lập)
+// Xuất riêng biệt cấu trúc cho TỪNG đề vào file exams.json (kèm toàn bộ mã audio MP3 đã gắn)
 window.exportExam = id => {
+    if(exam && exam.id === id) {
+        if(!syncCurrentSettingsToExam()) return;
+        saveLib();
+    }
     const x = lib.find(y => y.id === id);
     if(!x) return;
     downloadJSON([x], 'exams.json');
@@ -549,7 +599,10 @@ function normExam(x, fallbackId) {
         openAt: +x.openAt || 0,
         closeAt: +x.closeAt || 0,
         shufGrp: !!x.shufGrp, shufQ: x.shufQ !== false, shufOpt: x.shufOpt !== false, proctor: !!x.proctor, maxViol: x.maxViol == null ? 3 : Math.max(0, parseInt(x.maxViol) || 0),
-        parts: x.parts, maxScore: +x.maxScore > 0 ? +x.maxScore : 10
+        parts: x.parts,
+        audio: typeof x.audio === 'string' ? x.audio.trim() : '',
+        audioName: typeof x.audioName === 'string' ? x.audioName : '',
+        maxScore: +x.maxScore > 0 ? +x.maxScore : 10
     };
     ensureParts(ne);
     return ne;
@@ -615,9 +668,7 @@ $('li-new').onchange = async e => {
     } catch(err) { alert('Lỗi: ' + err.message); }
 };
 
-// ===== PHẦN LỚN (PART 1 / PART 2 / ...) =====
-// Mỗi dòng tiêu đề dạng "PART n ..." mở một phần lớn: mọi mục phía sau mang số phần pt = n (it.ph = dòng tiêu đề phần).
-// Các phần luôn giữ đúng thứ tự Part 1, Part 2, ...; việc đảo chỉ diễn ra BÊN TRONG từng phần.
+// ===== PHẦN LỚN (PART 1 / PART 2 / ...) + NHÚNG MÃ FILE AUDIO MP3 =====
 function tagParts(items) {
     let n = 0;
     items.forEach(it => {
@@ -648,22 +699,94 @@ function ensureParts(x) {
         x.parts[p.n] = {
             ord: isListen(p.title) ? 'keep' : (o.ord === 'keep' ? 'keep' : 'shuffle'),
             opt: o.opt !== false,
-            audio: typeof o.audio === 'string' ? o.audio.trim() : ''
+            audio: typeof o.audio === 'string' ? o.audio.trim() : '',
+            audioName: typeof o.audioName === 'string' ? o.audioName : ''
         };
     });
+    if(typeof x.audio !== 'string') x.audio = '';
+    if(typeof x.audioName !== 'string') x.audioName = '';
     if(!(x.maxScore > 0)) x.maxScore = 10;
     return x;
 }
 
+function renderAudioPickerHtml(pt, audioVal, audioName) {
+    const isB64 = /^data:audio\//i.test(audioVal || '');
+    const dispVal = isB64 ? '' : (audioVal || '');
+    const statusText = isB64
+        ? `✅ Đã nhúng mã file: <b>${esc(audioName || 'audio.mp3')}</b> (${Math.round(audioVal.length * 0.75 / 1024)} KB) — Mã âm thanh sẽ được xuất chung vào file exams.json.`
+        : (dispVal ? `🔗 Đang dùng đường dẫn/tên file: <b>${esc(dispVal)}</b>` : 'Chưa gắn file nghe');
+    return `
+        <div class="pcfg-r au-Wrap" data-pt="${pt}">
+            <label style="flex:1;min-width:240px">🎧 File ghi âm MP3 (nhập tên file/link hoặc chọn file .mp3 để nhúng mã vào đề)
+                <input type="text" class="pc-au" value="${esc(dispVal)}" data-b64="${isB64 ? esc(audioVal) : ''}" data-name="${esc(audioName || '')}" placeholder="vd: nghe.mp3, https://... hoặc bấm Chọn file .mp3 bên cạnh" oninput="onAuInputChange(this)">
+            </label>
+            <label class="btn sec" style="margin:0;cursor:pointer">
+                📂 Chọn file .mp3 (nhúng mã)
+                <input type="file" accept=".mp3,audio/*" hidden onchange="pickMp3File(this)">
+            </label>
+            <button type="button" class="btn sec" style="margin:0;color:var(--bad);border-color:var(--bad)" onclick="clearMp3File(this)">✕ Xóa audio</button>
+        </div>
+        <div class="note au-st" style="margin-top:4px">${statusText}</div>`;
+}
+
+window.onAuInputChange = input => {
+    const wrap = input.closest('.au-Wrap');
+    const st = wrap.nextElementSibling;
+    const v = input.value.trim();
+    if(v) {
+        st.innerHTML = `🔗 Đang dùng đường dẫn/tên file: <b>${esc(v)}</b>`;
+    } else if(input.dataset.b64) {
+        st.innerHTML = `✅ Đã nhúng mã file: <b>${esc(input.dataset.name || 'audio.mp3')}</b> (${Math.round(input.dataset.b64.length * 0.75 / 1024)} KB)`;
+    } else {
+        st.innerHTML = 'Chưa gắn file nghe';
+    }
+};
+
+window.pickMp3File = input => {
+    const f = input.files && input.files[0];
+    input.value = '';
+    if(!f) return;
+    const wrap = input.closest('.au-Wrap');
+    const txt = wrap.querySelector('.pc-au');
+    const st = wrap.nextElementSibling;
+    st.innerHTML = '⏳ Đang mã hóa file MP3...';
+    const reader = new FileReader();
+    reader.onload = () => {
+        const b64 = String(reader.result || '');
+        txt.value = '';
+        txt.dataset.b64 = b64;
+        txt.dataset.name = f.name;
+        st.innerHTML = `✅ Đã nhúng mã file: <b>${esc(f.name)}</b> (${Math.round(f.size / 1024)} KB) — Mã âm thanh đã gắn vào đề, bấm "Lưu cài đặt" hoặc "Xuất thư viện (exams.json)".`;
+        if(exam) { syncCurrentSettingsToExam(); saveLib(); renderTeacherPreview(); }
+    };
+    reader.onerror = () => { st.innerHTML = '<span style="color:var(--bad)">❌ Lỗi đọc file MP3!</span>'; };
+    reader.readAsDataURL(f);
+};
+
+window.clearMp3File = btn => {
+    const wrap = btn.closest('.au-Wrap');
+    const txt = wrap.querySelector('.pc-au');
+    txt.value = '';
+    txt.dataset.b64 = '';
+    txt.dataset.name = '';
+    wrap.nextElementSibling.innerHTML = 'Chưa gắn file nghe';
+    if(exam) { syncCurrentSettingsToExam(); saveLib(); renderTeacherPreview(); }
+};
+
 function renderPartCfg() {
     const list = partList(exam.items), box = $('part-cfg');
-    box.classList.toggle('hide', !list.length);
+    box.classList.remove('hide');
     $('legacy-shuf').classList.toggle('hide', !!list.length);
-    if(!list.length) { box.innerHTML = ''; return; }
-    box.innerHTML = '<b>🔀 Cài đặt đảo theo từng phần lớn</b>'
-        + '<div class="note" style="margin-top:4px">Các phần luôn giữ thứ tự Part 1 → Part 2 → Part 3. <b>Đảo</b> = đảo vị trí các phần nhỏ bên trong và đảo câu hỏi trong phần nhỏ gồm các câu độc lập; câu thuộc bài đọc / bài điền từ luôn giữ thứ tự trong bài. <b>Giữ nguyên</b> = không đổi vị trí phần nhỏ và câu hỏi.</div>'
+    if(!list.length) {
+        box.innerHTML = '<b>🎧 Cài đặt File nghe (Audio MP3) cho đề thi</b>'
+            + '<div class="note" style="margin-top:4px">Bạn có thể nhập tên file <b>.mp3</b> (đặt cùng thư mục index.html) hoặc bấm <b>📂 Chọn file .mp3 (nhúng mã)</b> để đóng gói trực tiếp mã âm thanh vào file <b>exams.json</b> theo đề thi này.</div>'
+            + renderAudioPickerHtml(0, exam.audio || '', exam.audioName || '');
+        return;
+    }
+    box.innerHTML = '<b>🔀 Cài đặt đảo &amp; File nghe MP3 theo từng phần lớn</b>'
+        + '<div class="note" style="margin-top:4px">Các phần luôn giữ thứ tự Part 1 → Part 2 → Part 3. <b>Đảo</b> = đảo vị trí các phần nhỏ bên trong và đảo câu hỏi độc lập; câu thuộc bài đọc / điền từ giữ thứ tự. Để gắn bài nghe, hãy nhập đường dẫn file <b>.mp3</b> hoặc bấm <b>📂 Chọn file .mp3 (nhúng mã)</b> để xuất thẳng mã âm thanh vào <b>exams.json</b>.</div>'
         + list.map(p => {
-            const c = exam.parts[p.n], lk = isListen(p.title);
+            const c = exam.parts[p.n] || {}, lk = isListen(p.title);
             return `<div class="pcfg" data-pt="${p.n}">
                 <div class="pcfg-t">${esc(p.title)} <span class="note" style="margin:0">(${p.nq} câu)</span></div>
                 <div class="pcfg-r">
@@ -675,27 +798,59 @@ function renderPartCfg() {
                     </label>
                     <label class="pc-chk"><input type="checkbox" class="pc-opt"${c.opt !== false ? ' checked' : ''}> Đảo đáp án A, B, C, D</label>
                 </div>
-                ${lk ? `<div class="pcfg-r"><label>🎧 File ghi âm (tùy chọn)<input type="text" class="pc-au" value="${esc(c.audio || '')}" placeholder="vd: nghe.mp3 hoặc https://..."></label></div>
-                <div class="note" style="margin-top:6px">Phần nghe luôn nằm đầu bài, giữ nguyên thứ tự khối và câu; chỉ đảo đáp án. Nếu nhập file ghi âm, học sinh có trình phát ngay dưới tiêu đề phần nghe (đặt file mp3 cùng thư mục với index.html trên Github).</div>` : ''}
+                ${renderAudioPickerHtml(p.n, c.audio || '', c.audioName || '')}
             </div>`;
         }).join('');
 }
 
 function readPartCfg() {
     const parts = {};
+    let examAudio = '', examAudioName = '';
+    const rootAu = document.querySelector('#part-cfg > .au-Wrap .pc-au');
+    if(rootAu) {
+        const typed = rootAu.value.trim();
+        examAudio = typed || rootAu.dataset.b64 || '';
+        examAudioName = typed ? '' : (rootAu.dataset.name || '');
+    }
     document.querySelectorAll('#part-cfg .pcfg').forEach(r => {
         const sel = r.querySelector('.pc-ord'), au = r.querySelector('.pc-au');
-        parts[+r.dataset.pt] = { ord: sel.disabled ? 'keep' : sel.value, opt: r.querySelector('.pc-opt').checked, audio: au ? au.value.trim() : '' };
+        const typed = au ? au.value.trim() : '';
+        const audio = typed || (au && au.dataset.b64) || '';
+        const audioName = typed ? '' : ((au && au.dataset.name) || '');
+        parts[+r.dataset.pt] = {
+            ord: sel.disabled ? 'keep' : sel.value,
+            opt: r.querySelector('.pc-opt').checked,
+            audio,
+            audioName
+        };
     });
-    return parts;
+    return { parts, examAudio, examAudioName };
+}
+
+function resolveAudioSrc(raw) {
+    if(!raw) return '';
+    const s = String(raw).trim();
+    if(/^data:audio\//i.test(s) || /^blob:/i.test(s)) return s;
+    // Tự động chuyển link chia sẻ Google Drive sang link phát trực tiếp
+    const gd = s.match(/drive\.google\.com\/file\/d\/([a-zA-Z0-9_-]+)/);
+    if(gd) return `https://drive.google.com/uc?export=download&id=${gd[1]}`;
+    try {
+        const u = new URL(s, location.href);
+        if(/^(https?:|file:|blob:|data:)$/.test(u.protocol)) return u.href;
+    } catch(e) {}
+    return s;
 }
 
 function audioHtml(pt) {
-    const c = exam && exam.parts && exam.parts[pt];
-    if(!c || !c.audio) return '';
-    let u; try { u = new URL(c.audio, location.href); } catch(e) { return ''; }
-    if(!/^https?:$/.test(u.protocol)) return '';
-    return `<div class="au">🎧 <audio controls preload="auto" controlsList="nodownload noplaybackrate" src="${esc(u.href)}"></audio></div>`;
+    let raw = '';
+    if(pt === 0) raw = exam && exam.audio;
+    else {
+        const c = exam && exam.parts && exam.parts[pt];
+        raw = c && c.audio;
+    }
+    const src = resolveAudioSrc(raw);
+    if(!src) return '';
+    return `<div class="au">🎧 <audio controls preload="auto" controlsList="nodownload noplaybackrate" src="${esc(src)}"></audio></div>`;
 }
 
 const MN='http://schemas.openxmlformats.org/officeDocument/2006/math',WN='http://schemas.openxmlformats.org/wordprocessingml/2006/main';
@@ -922,11 +1077,11 @@ $('file').onchange = async e => {
     
     const ex={
         id:'e'+Date.now(), name:f.name.replace(/\.docx$/i,''), at:Date.now(), 
-        items, eq, img:IM, time:0, scale: items.some(it=>it.ph) ? 'hsg' : 'english', maxScore:10, parts:{}, openAt:0, closeAt:0,
+        items, eq, img:IM, time:0, scale: items.some(it=>it.ph) ? 'hsg' : 'english', maxScore:10, parts:{}, audio:'', audioName:'', openAt:0, closeAt:0,
         shufGrp: false, shufQ: true, shufOpt: true
     };
     const old=lib.find(y=>y.name===ex.name);
-    if(old){ ex.id=old.id; ex.time=old.time||0; ex.openAt=old.openAt||0; ex.closeAt=old.closeAt||0; ex.scale=old.scale||'english'; ex.shufGrp=!!old.shufGrp; ex.shufQ=old.shufQ!==false; ex.shufOpt=old.shufOpt!==false; ex.proctor=!!old.proctor; ex.maxViol=old.maxViol; ex.maxScore=old.maxScore||10; ex.parts=old.parts||{}; }
+    if(old){ ex.id=old.id; ex.time=old.time||0; ex.openAt=old.openAt||0; ex.closeAt=old.closeAt||0; ex.scale=old.scale||'english'; ex.shufGrp=!!old.shufGrp; ex.shufQ=old.shufQ!==false; ex.shufOpt=old.shufOpt!==false; ex.proctor=!!old.proctor; ex.maxViol=old.maxViol; ex.maxScore=old.maxScore||10; ex.parts=old.parts||{}; ex.audio=old.audio||''; ex.audioName=old.audioName||''; }
     ensureParts(ex); lib=lib.filter(y=>y.name!==ex.name); lib.push(ex); saveLib();
     openExam(ex.id);
     
@@ -1010,7 +1165,8 @@ var QL = 'Câu';
 function renderBlocks(list, isEn, qHtml) {
     let n = 0;
     QL = isEn ? 'Question' : 'Câu';
-    return splitBlocks(list, isEn).map(b => {
+    const topAu = (!list.some(it => it.ph) && exam && exam.audio) ? `<div class="card" style="padding:12px 16px">${audioHtml(0)}</div>` : '';
+    return topAu + splitBlocks(list, isEn).map(b => {
         let map = null;
         if (isEn) { map = {}; let k = n; b.items.forEach(({ it }) => { if (it.k === 'q') { k++; map[it.on ?? it.no ?? k] = k; } }); }
         let D = '', L = '', R = '', lead = true;
@@ -1063,14 +1219,17 @@ function renderTeacherPreview(shufNote) {
 }
 window.previewShuffle = () => {
     if(!exam) return;
+    const pcfg = readPartCfg();
     const conf = Object.assign({}, exam, {
         scale: $('exam-scale').value, shufGrp: $('chk-shuf-grp').checked, shufQ: $('chk-shuf-q').checked, shufOpt: $('chk-shuf-opt').checked,
-        parts: partList(exam.items).length ? readPartCfg() : exam.parts
+        parts: partList(exam.items).length ? pcfg.parts : exam.parts,
+        audio: pcfg.examAudio
     });
-    const keep = exam.parts; exam.parts = conf.parts;   // để trình phát audio / tiêu đề dùng đúng cài đặt đang chọn
+    const keepP = exam.parts, keepA = exam.audio;
+    exam.parts = conf.parts; exam.audio = conf.audio;
     cur = shuffleExamItems(exam.items, conf);
     renderTeacherPreview(true);
-    exam.parts = keep;
+    exam.parts = keepP; exam.audio = keepA;
 };
 window.previewOriginal = () => { if(!exam) return; cur = JSON.parse(JSON.stringify(exam.items)); renderTeacherPreview(); };
 $('exam-scale').onchange = () => renderTeacherPreview();
@@ -1154,9 +1313,15 @@ async function initStudentFlow(id) {
         const sd = Date.parse(res.headers.get('Date') || '');
         if (isFinite(sd)) serverOffset = sd - (t0 + t1) / 2;
         const data = await res.json();
-        // data được export là array có 1 phần tử hoặc thư viện cũ nhiều phần tử
         exam = Array.isArray(data) ? data.find(x => x.id === id) : null;
     } catch(e) {}
+
+    if(!exam) {
+        const dbLib = await idbOp('readonly', (st, res) => {
+            const g = st.get(LK); g.onsuccess = () => res(g.result); g.onerror = () => res(null);
+        });
+        if(Array.isArray(dbLib)) exam = dbLib.find(x => x.id === id) || null;
+    }
 
     if(!exam) {
         let local = [];
@@ -1467,8 +1632,6 @@ function loadProg() { try { return JSON.parse(sessionStorage.getItem(progKey()) 
 window.addEventListener('beforeunload', e => { if(examRunning && !submitted) { e.preventDefault(); e.returnValue = ''; } });
 
 // ===================== CHỈ CHO XEM ĐIỂM SAU KHI HẾT HẠN THỜI GIAN THI =====================
-// Mốc được xem điểm: giờ đóng đề (khi đó mọi học sinh đều đã hết giờ); nếu đề không đặt giờ đóng
-// thì lấy hạn làm bài của chính học sinh đó. Đề không giới hạn thời gian => 0 (xem ngay).
 function revealAtMs() {
     if(exam.closeAt && exam.closeAt > 0) return exam.closeAt;
     return isFinite(examEndAt) ? examEndAt : 0;
@@ -1716,7 +1879,6 @@ async function pgCam() {
   } catch (e) { return false; }
 }
 
-// Gọi ngay khi học sinh bấm "Bắt đầu làm bài" (phải có thao tác bấm thì trình duyệt mới cho toàn màn hình)
 async function pgStart() {
   if (PG.busy) return false;
   PG.busy = 1;
@@ -1746,7 +1908,6 @@ function pgBegin(sv) {
   document.body.classList.add('pg-lock'); pgGuard(); shStart();
   pgDetectInit();
   clearInterval(PG.tm); PG.tm = setInterval(pgTick, 1000);
-  // Tải lại trang: tính 1 lần vi phạm, bắt buộc bấm tiếp tục để bật lại camera + toàn màn hình
   if (sv) pgViol('Tải lại trang hoặc mở lại bài thi');
 }
 
@@ -1760,7 +1921,7 @@ async function pgDetectInit() {
       baseOptions: { modelAssetPath: 'https://storage.googleapis.com/mediapipe-models/face_detector/blaze_face_short_range/float16/1/blaze_face_short_range.tflite' },
       runningMode: 'VIDEO', minDetectionConfidence: 0.5
     });
-  } catch (e) { PG.det = null; } // không tải được thư viện: chỉ giám sát camera bật/tắt, không phạt oan
+  } catch (e) { PG.det = null; }
 }
 
 function pgTick() {
@@ -1786,7 +1947,7 @@ function pgShow(reason) {
 function pgViol(reason) {
   if (!PG.on || PG.mute || submitted || !examRunning) return;
   const now = Date.now();
-  if (now - PG.last < 2000) return; // 1 sự cố có thể bắn nhiều sự kiện (blur + đổi tab + thoát toàn màn hình)
+  if (now - PG.last < 2000) return;
   PG.last = now;
   PG.viol.push({ t: now, r: reason });
   saveProg();
@@ -1825,7 +1986,6 @@ function pgGuard() {
   PG.mo.observe($('list-student'), { childList: true, subtree: true });
 }
 
-// Mỗi lần cố bôi đen / sao chép / chuột phải: bị chặn + nhắc; cố 5 lần mới tính 1 vi phạm
 function pgBlock() {
   PG.sel = (PG.sel || 0) + 1;
   if (PG.sel >= 5) { PG.sel = 0; pgViol('Cố bôi đen văn bản / tra từ điển nhiều lần'); return; }
@@ -1851,10 +2011,6 @@ document.addEventListener('selectionchange', () => {
 
 
 // ===================== CHỐNG CHỤP MÀN HÌNH =====================
-// Lưu ý: trình duyệt KHÔNG cho phép chặn hẳn việc chụp màn hình (nhất là trên điện thoại), nên dùng 3 lớp răn đe:
-//  1) Hình mờ tên + lớp + giờ phủ kín màn hình (giữ cả lúc xem lại bài) -> ảnh chụp/quay/chụp bằng máy khác đều truy ra người làm.
-//  2) Phát hiện phím chụp màn hình / in trên máy tính -> ghi vi phạm, xóa clipboard, chặn in.
-//  3) Rời cửa sổ (kể cả mở công cụ chụp, ứng dụng khác) -> nội dung đề bị ẩn cho đến khi quay lại.
 const SH = { on: 0, tm: null, n: 0 };
 
 function shWmSvg() {
@@ -1888,7 +2044,7 @@ function shStart() {
   clearInterval(SH.tm);
   SH.tm = setInterval(() => {
     if (!shWmOk()) { shWmMake(); pgViol('Gỡ hoặc che hình mờ chống chụp màn hình'); }
-    else if (++SH.n % 30 === 0) shWmMake(); // cập nhật giờ trên hình mờ
+    else if (++SH.n % 30 === 0) shWmMake();
   }, 1000);
 }
 
@@ -1898,7 +2054,6 @@ window.addEventListener('focus', () => shBlur(0));
 document.addEventListener('visibilitychange', () => { if (!document.hidden) shBlur(0); else if (pgOn() && !PG.mute) shBlur(1); });
 
 function shShot(reason) {
-  // Xóa ảnh vừa chụp khỏi clipboard (làm được tới đâu hay tới đó)
   const wipe = () => { try { navigator.clipboard && navigator.clipboard.writeText('Không được chụp màn hình bài thi').catch(() => {}); } catch (e) {} };
   wipe(); setTimeout(wipe, 300);
   pgViol(reason);
